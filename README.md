@@ -4,7 +4,7 @@
 An async Python client library for the Spotify web API   
 Speedyspotify uses gevent to perform all Spotify API requests asynchronously as well as implementing several convenience methods to make working with the Spotify WEB API a breeze  
 
-This package is in experimental stages, use at your own risk.  
+This package is experimental, use at your own risk.  
 Issues and pull requests are welcome!  
 
 Tested on Python 3.4.3. Should work on any version after 3.4. Python 2 is not supported.  

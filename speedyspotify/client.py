@@ -1,4 +1,4 @@
-from functools import partialmethod, partial
+from functools import partialmethod, partial, update_wrapper
 import json
 import inspect
 import math
@@ -9,10 +9,19 @@ from gevent.pool import Pool as GeventPool
 import gevent
 from gevent import monkey
 
-from .util import get_id, get_ids, find_item, get_uri, get_uris, chunked
+from .util import get_id, get_ids, find_item, get_uri, get_uris, chunked, extract_list
 
 monkey.patch_all(thread=False, select=False)
+#monkey.patch_all(select=False)
 
+
+class SpotiRetry(Retry):
+    def parse_retry_after(self, retry_after):
+        seconds = super().parse_retry_after(retry_after)
+        if seconds:
+            return seconds*2
+        return seconds
+    
 
 def max_limit(limit):
     def decorator(func):
@@ -39,22 +48,30 @@ class GletList(list):
     def __init__(self, items, fetchmethod):
         super().__init__(items)
         self.fetch = partial(fetchmethod, self)
+        update_wrapper(self.fetch, fetchmethod)
 
         
 class SpotifyException(Exception):
-    def __init__(self, status, msg, body):
-        self.status = status
-        self.msg = msg
-        self.body = body
-
+    def __init__(self, request, response):
+        self.http_status = response.status_code
+        if response.text:
+            try:
+                msg = response.json()['error']['message']
+            except (ValueError, KeyError):
+                msg = response.text
+        else:
+            msg = 'Unkown error occured'
+        self.response = response
+        self.request = request
+        super().__init__(self.http_status, msg, request.url)
 
 class Spotify(object):
     prefix = 'https://api.spotify.com/v1'
-    _pool_size = 20
+    _pool_size = 10
     _max_retries = 5
     _timeout = 10
 
-    def __init__(self, access_token=None, requests_session=None, pool_size=20, max_retries=5, timeout=10):
+    def __init__(self, access_token=None, requests_session=None, pool_size=5, max_retries=5, timeout=10, gpool=False):
         """
         :param access_token: a spotify access token, either a token dict or access token string
         :param requests_session: used for API requests, if not specified self.default_session() is used
@@ -70,21 +87,24 @@ class Spotify(object):
             self.access_token = access_token['access_token']
         else:
             self.access_token = access_token
-        self._gpool = GeventPool(self._pool_size)
+        if gpool:
+            self._gpool = GeventPool(self._pool_size)
+        else: self._gpool = None
 
         for method in inspect.getmembers(self, predicate=inspect.ismethod):
             f = method[1]
             if any([hasattr(f, 'chunk_size'), hasattr(f, 'max_limit')]):
                 f.__func__.all = partial(self.all, f)
+                update_wrapper(f.__func__.all, self.all)
 
     def default_session(self):
         session = requests.session()
-        retry = Retry(total=self._max_retries,
-                      backoff_factor=0.1,
-                      method_whitelist=['GET', 'POST', 'PUT'],
-                      status_forcelist=[429]+list(range(500, 600)),
-                      respect_retry_after_header=True,
-                      raise_on_status=True)
+        retry = SpotiRetry(total=self._max_retries,
+                           backoff_factor=1.5,
+                           method_whitelist=['GET', 'POST', 'PUT', 'DELETE'],
+                           status_forcelist=[429]+list(range(500, 600)),
+                           respect_retry_after_header=True,
+                           raise_on_status=False)
         ap = requests.adapters.HTTPAdapter(
             max_retries=retry,
             pool_block=False,
@@ -112,9 +132,11 @@ class Spotify(object):
 
         if payload:
             kwargs["data"] = json.dumps(payload)
-        r = self._gpool.spawn(self.session.request, method, url, headers=headers, **kwargs)
+        gs = self._gpool.spawn if self._gpool else gevent.spawn
+        r = gs(self.session.request, method, url, headers=headers, **kwargs)
         r.fetch = partial(self.join, r)
-        gevent.sleep()
+        update_wrapper(r.fetch, self.join)
+        gevent.sleep(0.05)
         return r
 
     _get = partialmethod(_request, 'GET')
@@ -139,8 +161,13 @@ class Spotify(object):
         return reqs
 
     def _all_chunked(self, func, *args, **kwargs):
+        unique = kwargs.pop('unique', False)
         args = list(args)
-        items = set(get_ids(func.object_type, args[0]))
+        items = get_ids(func.object_type, args[0])
+        if unique:
+            seen = set()
+            seen_add = seen.add
+            items = [iid for iid in items if not (iid in seen or seen_add(iid))]
         reqs = []
         chunk_size = kwargs.get('chunk_size') or func.chunk_size
         for chunk in chunked(items, chunk_size):
@@ -153,11 +180,15 @@ class Spotify(object):
 
     def all(self, func, *args, **kwargs):
         """
-        Get all results from given function with given arguments
-        as GletList with a fetch method.  
+        Get a list of Greenlet requests for all results from given endpoint/function.
 
-        func: api function to call (e.g. 'current_user_saved_tracks')
-        *args/**kwargs: any arguments func accepts
+        :param func: Any Spotify function which normally returns paginated result sets
+        or accepts a limited length argument list.
+        :param unique: bool default False - each unique ID only passed to func once
+        
+        Other *args/**kwargs passed to |func|
+
+        :return GletList:
         """
         if isinstance(func, str):
             func = getattr(self, func)
@@ -174,7 +205,7 @@ class Spotify(object):
         one_request.join()
         response = one_request.value
         if not response.ok:
-            raise SpotifyException(response.status_code, response.json(), response.request.body)
+            raise SpotifyException(response.request, response)
         if not response.text:
             return None
         result = one_request.value.json()
@@ -182,20 +213,33 @@ class Spotify(object):
             return find_item(extract, result)
         return result
 
-    def _join_many(self, request_objects, extract=None):
+    def _join_many(self, request_objects, extract=False):
+        """
+        Join given list of request_objects and return a list
+        of Spotify objects in dict format.
+        
+        :param request_objects: List of gevent Greenlets
+        :param extract: Any truthy value to automatically concat list results.
+        Useful when fetching multiple pages of a paged result set.
+        """
         gevent.joinall(request_objects)
+        results = []
         for g in request_objects:
             response = g.value
             if not response.ok:
-                raise SpotifyException(response.status_code, response.json(), response.request.body)
+                raise SpotifyException(response.request, response)
             if not response.text:
-                yield None
+                results.append(None)
                 continue
+                # yield None
+                # continue
             jso = response.json()
             if extract:
-                yield from find_item(extract, jso)
+                results += [x for x in extract_list(jso)]
+                # yield from find_item(extract, jso)
             else:
-                yield jso
+                results.append(jso)
+        return results
 
     def join(self, request_objects, extract=None):
         if isinstance(request_objects, gevent.Greenlet):
@@ -315,6 +359,14 @@ class Spotify(object):
         return self._get(url.format(user_id=uid, playlist_id=plid), **params)
 
     def user_playlist_create(self, user, name, public=True, collaborative=False):
+        """
+        Create playlist for given user. 
+
+        :param user: user id or spotify User object  
+        :param name: str name for new playlist  
+        :param public: bool
+        :param collaborative: bool
+        """
         url = '/users/{user_id}/playlists'
         uid = get_id('user', user)
         body = dict(name=name, public=public, collaborative=collaborative)

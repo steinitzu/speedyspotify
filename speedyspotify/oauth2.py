@@ -6,6 +6,8 @@ import json
 import time
 import sys
 
+from .client import Spotify
+
 """
 Borrowed from Spotipy
 """
@@ -293,3 +295,10 @@ class SpotifyOAuth(object):
     def _warn(self, msg):
         print('warning:' + msg, file=sys.stderr)
 
+
+def from_env_token():
+    auth = SpotifyOAuth(os.environ['SPOTIFY_CLIENT_ID'],
+                        os.environ['SPOTIFY_CLIENT_SECRET'],
+                        os.environ['SPOTIFY_REDIRECT_URI'])
+    token = auth.refresh_access_token(os.environ['SPOTIFY_REFRESH_TOKEN'])
+    return Spotify(access_token=token)        

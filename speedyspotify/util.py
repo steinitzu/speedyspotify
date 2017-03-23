@@ -1,3 +1,5 @@
+import os
+
 
 def id_from_str(strid):
     if strid.startswith('http'):
@@ -71,4 +73,16 @@ def chunked(seq, n):
     if chunk:
         yield chunk
         
-    
+
+def extract_list(item):
+    if isinstance(item, list):
+        return item
+    if 'items' in item:
+        return item['items']
+    if 'tracks' in item:
+        return item['tracks']
+    if 'albums' in item:
+        return item['albums']
+    if 'artists' in item:
+        return item['artists']
+    raise Exception('No item list detected')
