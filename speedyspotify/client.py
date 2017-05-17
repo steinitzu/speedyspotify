@@ -11,7 +11,7 @@ from gevent import monkey
 
 from .util import get_id, get_ids, find_item, get_uri, get_uris, chunked, extract_list
 
-monkey.patch_all(thread=False, select=False)
+monkey.patch_all(thread=False, select=False, ssl=False)
 #monkey.patch_all(select=False)
 
 
@@ -71,7 +71,8 @@ class Spotify(object):
     _max_retries = 5
     _timeout = 10
 
-    def __init__(self, access_token=None, requests_session=None, pool_size=5, max_retries=5, timeout=10, gpool=False):
+    def __init__(self, access_token=None, requests_session=None,
+                 gpool_size=2, pool_size=5, max_retries=5, timeout=10, gpool=False):
         """
         :param access_token: a spotify access token, either a token dict or access token string
         :param requests_session: used for API requests, if not specified self.default_session() is used
@@ -88,7 +89,7 @@ class Spotify(object):
         else:
             self.access_token = access_token
         if gpool:
-            self._gpool = GeventPool(self._pool_size)
+            self._gpool = GeventPool(gpool_size)
         else: self._gpool = None
 
         for method in inspect.getmembers(self, predicate=inspect.ismethod):
@@ -100,7 +101,7 @@ class Spotify(object):
     def default_session(self):
         session = requests.session()
         retry = SpotiRetry(total=self._max_retries,
-                           backoff_factor=1.5,
+                           backoff_factor=1,
                            method_whitelist=['GET', 'POST', 'PUT', 'DELETE'],
                            status_forcelist=[429]+list(range(500, 600)),
                            respect_retry_after_header=True,
@@ -136,7 +137,7 @@ class Spotify(object):
         r = gs(self.session.request, method, url, headers=headers, **kwargs)
         r.fetch = partial(self.join, r)
         update_wrapper(r.fetch, self.join)
-        gevent.sleep(0.05)
+        #gevent.sleep(0.05)
         return r
 
     _get = partialmethod(_request, 'GET')
@@ -145,19 +146,26 @@ class Spotify(object):
     _delete = partialmethod(_request, 'DELETE')
 
     def _all_with_offset(self, func, *args, **kwargs):
-        kwargs['limit'] = 1
-        first = func(*args, **kwargs).fetch()
-        total = find_item('total', first)
-        limit = func.max_limit
-        kwargs['limit'] = limit
+        max_chunks = kwargs.pop('max_chunks', None)
+        kwargs['limit'] = limit = func.max_limit
 
-        callcount = math.ceil(total/limit)
-        i = 0
-        reqs = []
+        first_req = func(*args, **kwargs)
+        first = first_req.fetch()
+        total = find_item('total', first)
+        if total <= kwargs['limit']:
+            return [first_req]
+        
+        callcount = math.ceil((total-limit)/limit)
+        i = limit
+        reqs = [first_req]
+        chunk_count = 1
         for c in range(callcount):
+            if max_chunks and chunk_count == max_chunks:
+                break
             kwargs['offset'] = i
             reqs.append(func(*args, **kwargs))
             i += limit
+            chunk_count += 1
         return reqs
 
     def _all_chunked(self, func, *args, **kwargs):
@@ -213,7 +221,7 @@ class Spotify(object):
             return find_item(extract, result)
         return result
 
-    def _join_many(self, request_objects, extract=False):
+    def _join_many(self, request_objects, extract=False, ignore_404=False):
         """
         Join given list of request_objects and return a list
         of Spotify objects in dict format.
@@ -227,6 +235,8 @@ class Spotify(object):
         for g in request_objects:
             response = g.value
             if not response.ok:
+                if response.status_code == 404 and ignore_404:
+                    continue
                 raise SpotifyException(response.request, response)
             if not response.text:
                 results.append(None)
@@ -241,10 +251,26 @@ class Spotify(object):
                 results.append(jso)
         return results
 
-    def join(self, request_objects, extract=None):
+    def _ijoin_many(self, request_objects):
+        for g in request_objects:
+            item = g.fetch('items')
+            response = item.value
+            if not response.ok:
+                raise SpotifyException(response.request, response)
+            if not response.text:
+                yield None
+                continue
+            jso = response.json()            
+            yield from extract_list(jso)
+
+    def join(self, request_objects, extract=None, ignore_404=False):
         if isinstance(request_objects, gevent.Greenlet):
             return self._join_one(request_objects, extract)
-        return self._join_many(request_objects, extract)
+        return self._join_many(request_objects, extract, ignore_404)
+
+    def ijoin(self, request_objects):
+        print('ijoining')
+        yield from self._ijoin_many(request_objects)
 
     def next(self, result):
         if result['next']:
@@ -273,7 +299,7 @@ class Spotify(object):
     def artist(self, artist):
         url = '/artists/{id}'
         aid = get_id('artist', artist)
-        return self.get(url.format(id=aid))
+        return self._get(url.format(id=aid))
 
     @chunk_size(50)
     @object_type('artist')
@@ -474,6 +500,13 @@ class Spotify(object):
         url = '/me/albums'
         return self._get(url, limit=limit, offset=offset, market=market)
 
+    @chunk_size(50)
+    @object_type('album')
+    def current_user_saved_albums_contains(self, albums):
+        url = '/me/albums/contains'
+        tids = ','.join(get_ids('album', albums))
+        return self._get(url, ids=tids)
+
     @max_limit(50)
     def current_user_saved_tracks(self, limit=20, offset=0, market=None):
         url = '/me/tracks'
@@ -485,17 +518,42 @@ class Spotify(object):
         return self._get(url, type='artist', limit=limit, after=after)
 
     @chunk_size(50)
+    @object_type('artist')
+    def current_user_followed_artists_add(self, artists):
+        url = '/me/following'
+        aids = ','.join(get_ids('artist', artists))
+        return self._put(url, type='artist', ids=aids)
+
+    @chunk_size(50)
+    @object_type('artist')
+    def current_user_followed_artists_remove(self, artists):
+        url = '/me/following'
+        aids = ','.join(get_ids('artist', artists))
+        return self._delete(url, type='artist', ids=aids)
+
+    @chunk_size(50)
+    @object_type('artist')
+    def current_user_followed_artists_contains(self, artists):
+        url = '/mefollowing/contains'
+        aids = ','.join(get_ids('artist', artists))
+        return self._get(url, type='artist', ids=aids)
+
+    @chunk_size(50)
     @object_type('track')
     def current_user_saved_tracks_delete(self, tracks):
         url = '/me/tracks'
         tids = ','.join(get_ids('track', tracks))
         return self._delete(url, ids=tids)
 
+    @chunk_size(50)
+    @object_type('track')
     def current_user_saved_tracks_contains(self, tracks):
         url = '/me/tracks/contains'  # ?ids=
         tids = ','.join(get_ids('track', tracks))
         return self._get(url, ids=tids)
 
+    @chunk_size(50)
+    @object_type('track')
     def current_user_saved_tracks_add(self, tracks):
         url = '/me/tracks'  # ?ids=
         tids = ','.join(get_ids('track', tracks))
@@ -516,10 +574,33 @@ class Spotify(object):
         url = '/me/player/recently-played'
         return self._get(url, after=after, before=before, limit=limit)
 
+    @chunk_size(50)
+    @object_type('album')
     def current_user_saved_albums_add(self, albums):
         url = '/me/albums'  # ?ids=
         aids = ','.join(get_ids('album', albums))
         return self._put(url, ids=aids)
+
+    @chunk_size(50)
+    @object_type('album')
+    def current_user_saved_albums_remove(self, albums):
+        url = '/me/albums'
+        aids = ','.join(get_ids('album', albums))
+        return self._delete(url, ids=aids)
+
+    def current_user_player_play(self, context_uri=None, uris=None, offset=None, device_id=None):
+        url = '/me/player/play'
+        payload = {}
+        if context_uri:
+            payload['context_uri'] = context_uri
+        if uris:
+            payload['uris'] = uris
+        if offset:
+            payload['offset'] = offset
+        params = {}
+        if device_id:
+            params['device_id'] = device_id
+        return self._put(url, payload=payload, **params)
 
     @max_limit(50)
     def featured_playlists(self, locale=None, country=None, timestamp=None, limit=20, offset=0):
