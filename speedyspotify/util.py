@@ -85,4 +85,6 @@ def extract_list(item):
         return item['albums']
     if 'artists' in item:
         return item['artists']
+    if 'audio_features' in item:
+        return item['audio_features']
     raise Exception('No item list detected')
