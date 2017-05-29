@@ -253,14 +253,14 @@ class Spotify(object):
 
     def _ijoin_many(self, request_objects):
         for g in request_objects:
-            item = g.fetch('items')
-            response = item.value
+            g.join()
+            response = g.value
             if not response.ok:
                 raise SpotifyException(response.request, response)
             if not response.text:
                 yield None
                 continue
-            jso = response.json()            
+            jso = response.json()
             yield from extract_list(jso)
 
     def join(self, request_objects, extract=None, ignore_404=False):
@@ -269,7 +269,6 @@ class Spotify(object):
         return self._join_many(request_objects, extract, ignore_404)
 
     def ijoin(self, request_objects):
-        print('ijoining')
         yield from self._ijoin_many(request_objects)
 
     def next(self, result):
