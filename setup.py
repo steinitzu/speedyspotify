@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='speedyspotify',
-    version='0.2.0',
+    version='0.2.1',
     description='Async Spotify web API client',
     author='Steinthor Palsson',
     author_email='steini90@gmail.com',
