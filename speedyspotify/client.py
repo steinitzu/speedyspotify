@@ -433,7 +433,7 @@ class Spotify(object):
         url = '/users/{user_id}/playlists/{playlist_id}/tracks'
         uid = get_id('user', user)
         plid = get_id('playlist', playlist)
-        turis = get_uris('track', get_ids('track', tracks))
+        turis = list(get_uris('track', get_ids('track', tracks)))
         body = dict(uris=turis)
         return self._put(url.format(user_id=uid, playlist_id=plid), payload=body)
 
