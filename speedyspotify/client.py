@@ -7,12 +7,13 @@ from requests.packages.urllib3.util.retry import Retry
 import requests
 from gevent.pool import Pool as GeventPool
 import gevent
-from gevent import monkey
 
 from .util import get_id, get_ids, find_item, get_uri, get_uris, chunked, extract_list
 
-monkey.patch_all(thread=False, select=False, ssl=False)
-#monkey.patch_all(select=False)
+
+def monkey_patch():
+    from gevent import monkey
+    monkey.patch_all(thread=False, select=False, ssl=False)
 
 
 class SpotiRetry(Retry):
